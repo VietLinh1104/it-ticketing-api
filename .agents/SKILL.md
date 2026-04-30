@@ -65,7 +65,8 @@ it-ticketing-api/
 │   ├── departmentRoutes.js
 │   └── ticketRoutes.js
 ├── middleware/
-│   └── protect.js
+│   ├── protect.js
+│   └── authorize.js       ← MỚI: kiểm tra role
 ├── .env
 ├── server.js
 └── package.json
@@ -84,10 +85,18 @@ const UserSchema = new mongoose.Schema({
   name:     { type: String, required: true },
   email:    { type: String, required: true, unique: true },
   password: { type: String, required: true },
+  role:     { type: String, enum: ['admin', 'manager', 'employee'], default: 'employee' }, // ← MỚI
 }, { timestamps: true });
 
 module.exports = mongoose.model('User', UserSchema);
 ```
+
+> **Thiết kế Role:**
+> | Role | Quyền hạn |
+> |---|---|
+> | `admin` | Toàn quyền trên tất cả resource |
+> | `manager` | Quản lý department và ticket |
+> | `employee` | Chỉ tạo và quản lý ticket của chính mình |
 
 ### 2. Department.js
 
@@ -150,6 +159,25 @@ const protect = async (req, res, next) => {
 module.exports = protect;
 ```
 
+### middleware/authorize.js ← MỚI
+
+> **Quan trọng:** Phải dùng SAU `protect` vì cần `req.user.role` đã được gán.
+
+```js
+const authorize = (...roles) => (req, res, next) => {
+  if (!roles.includes(req.user.role)) {
+    return res.status(403).json({
+      status: 403,
+      message: 'Forbidden – insufficient permissions',
+      data: null
+    });
+  }
+  next();
+};
+
+module.exports = authorize;
+```
+
 ---
 
 ## Controllers
@@ -197,12 +225,15 @@ exports.loginEmployee = async (req, res) => {
 
 ### controllers/departmentController.js
 
-> Tất cả Department routes là **Public Access** – không cần `protect` middleware.
+> Department routes yêu cầu **Authentication** (`protect`) và **Authorization** (`authorize`):
+> - GET: tất cả roles
+> - POST / PUT: `admin`, `manager`
+> - DELETE: chỉ `admin`
 
 ```js
 const Department = require('../models/Department');
 
-// POST /api/departments
+// POST /api/departments  [admin, manager]
 exports.createDepartment = async (req, res) => {
   try {
     const dept = await Department.create(req.body);
@@ -210,15 +241,26 @@ exports.createDepartment = async (req, res) => {
   } catch (err) { res.status(400).json({ status: 400, message: err.message, data: null }); }
 };
 
-// GET /api/departments
+// GET /api/departments  [all roles]
 exports.getDepartments = async (req, res) => {
   try {
-    const depts = await Department.find();
-    res.status(200).json({ status: 200, message: 'Success', data: depts });
+    const page   = parseInt(req.query.page)  || 1;
+    const limit  = parseInt(req.query.limit) || 10;
+    const skip   = (page - 1) * limit;
+    const sortBy = req.query.sortBy || 'createdAt';
+    const order  = req.query.order === 'asc' ? 1 : -1;
+
+    const depts = await Department.find()
+      .sort({ [sortBy]: order })
+      .skip(skip)
+      .limit(limit);
+
+    const total = await Department.countDocuments();
+    res.status(200).json({ status: 200, message: 'Success', data: { total, page, limit, departments: depts } });
   } catch (err) { res.status(500).json({ status: 500, message: err.message, data: null }); }
 };
 
-// GET /api/departments/:id
+// GET /api/departments/:id  [all roles]
 exports.getDepartmentById = async (req, res) => {
   try {
     const dept = await Department.findById(req.params.id);
@@ -227,7 +269,7 @@ exports.getDepartmentById = async (req, res) => {
   } catch (err) { res.status(500).json({ status: 500, message: err.message, data: null }); }
 };
 
-// PUT /api/departments/:id
+// PUT /api/departments/:id  [admin, manager]
 exports.updateDepartment = async (req, res) => {
   try {
     const dept = await Department.findByIdAndUpdate(req.params.id, req.body, { new: true });
@@ -236,7 +278,7 @@ exports.updateDepartment = async (req, res) => {
   } catch (err) { res.status(400).json({ status: 400, message: err.message, data: null }); }
 };
 
-// DELETE /api/departments/:id
+// DELETE /api/departments/:id  [admin only]
 exports.deleteDepartment = async (req, res) => {
   try {
     const dept = await Department.findByIdAndDelete(req.params.id);
@@ -251,11 +293,14 @@ exports.deleteDepartment = async (req, res) => {
 ### controllers/ticketController.js
 
 > Tất cả Ticket routes đều **Protected**. `getTickets` bắt buộc có Pagination + Sorting.
+> Phân quyền ticket theo role:
+> - `employee`: chỉ thấy / sửa ticket của chính mình
+> - `admin`, `manager`: thấy và quản lý tất cả ticket
 
 ```js
 const Ticket = require('../models/Ticket');
 
-// POST /api/tickets  [protected]
+// POST /api/tickets  [all roles]
 exports.createTicket = async (req, res) => {
   try {
     // Tự động gán employee từ token đã giải mã
@@ -274,12 +319,15 @@ exports.getTickets = async (req, res) => {
     const sortBy = req.query.sortBy || 'createdAt';
     const order  = req.query.order === 'asc' ? 1 : -1;
 
-    const tickets = await Ticket.find()
+    // employee chỉ thấy ticket của mình; admin/manager thấy tất cả
+    const filter = req.user.role === 'employee' ? { employee: req.user.id } : {};
+
+    const tickets = await Ticket.find(filter)
       .sort({ [sortBy]: order })
       .skip(skip)
       .limit(limit);
 
-    const total = await Ticket.countDocuments();
+    const total = await Ticket.countDocuments(filter);
     res.status(200).json({ status: 200, message: 'Success', data: { total, page, limit, tickets } });
   } catch (err) { res.status(500).json({ status: 500, message: err.message, data: null }); }
 };
@@ -291,6 +339,11 @@ exports.getTicketById = async (req, res) => {
       .populate('department', 'name officeLocation')
       .populate('employee',   'name email');
     if (!ticket) return res.status(404).json({ status: 404, message: 'Ticket not found', data: null });
+
+    // employee chỉ được xem ticket của mình
+    if (req.user.role === 'employee' && ticket.employee._id.toString() !== req.user.id)
+      return res.status(403).json({ status: 403, message: 'Forbidden – not your ticket', data: null });
+
     res.status(200).json({ status: 200, message: 'Success', data: ticket });
   } catch (err) { res.status(500).json({ status: 500, message: err.message, data: null }); }
 };
@@ -301,8 +354,8 @@ exports.updateTicket = async (req, res) => {
     const ticket = await Ticket.findById(req.params.id);
     if (!ticket) return res.status(404).json({ status: 404, message: 'Ticket not found', data: null });
 
-    // Data Ownership: chỉ employee tạo ticket mới được sửa
-    if (ticket.employee.toString() !== req.user.id)
+    // employee chỉ được sửa ticket của mình; admin/manager được sửa tất cả
+    if (req.user.role === 'employee' && ticket.employee.toString() !== req.user.id)
       return res.status(403).json({ status: 403, message: 'Forbidden – not your ticket', data: null });
 
     const updated = await Ticket.findByIdAndUpdate(req.params.id, req.body, { new: true });
@@ -310,15 +363,11 @@ exports.updateTicket = async (req, res) => {
   } catch (err) { res.status(400).json({ status: 400, message: err.message, data: null }); }
 };
 
-// DELETE /api/tickets/:id  [protected + data ownership]
+// DELETE /api/tickets/:id  [admin, manager only]
 exports.deleteTicket = async (req, res) => {
   try {
     const ticket = await Ticket.findById(req.params.id);
     if (!ticket) return res.status(404).json({ status: 404, message: 'Ticket not found', data: null });
-
-    // Data Ownership: chỉ employee tạo ticket mới được xoá
-    if (ticket.employee.toString() !== req.user.id)
-      return res.status(403).json({ status: 403, message: 'Forbidden – not your ticket', data: null });
 
     await ticket.deleteOne();
     res.status(200).json({ status: 200, message: 'Ticket deleted', data: null });
@@ -346,21 +395,23 @@ module.exports = router;
 ### routes/departmentRoutes.js
 
 ```js
-const express = require('express');
-const router  = express.Router();
+const express    = require('express');
+const router     = express.Router();
+const protect    = require('../middleware/protect');
+const authorize  = require('../middleware/authorize');
 const {
   createDepartment, getDepartments, getDepartmentById,
   updateDepartment, deleteDepartment
 } = require('../controllers/departmentController');
 
 router.route('/')
-  .post(createDepartment)
-  .get(getDepartments);
+  .get(protect, getDepartments)                                         // all roles
+  .post(protect, authorize('admin', 'manager'), createDepartment);      // admin, manager
 
 router.route('/:id')
-  .get(getDepartmentById)
-  .put(updateDepartment)
-  .delete(deleteDepartment);
+  .get(protect, getDepartmentById)                                      // all roles
+  .put(protect, authorize('admin', 'manager'), updateDepartment)        // admin, manager
+  .delete(protect, authorize('admin'), deleteDepartment);               // admin only
 
 module.exports = router;
 ```
@@ -368,22 +419,23 @@ module.exports = router;
 ### routes/ticketRoutes.js
 
 ```js
-const express  = require('express');
-const router   = express.Router();
-const protect  = require('../middleware/protect');
+const express    = require('express');
+const router     = express.Router();
+const protect    = require('../middleware/protect');
+const authorize  = require('../middleware/authorize');
 const {
   createTicket, getTickets, getTicketById,
   updateTicket, deleteTicket
 } = require('../controllers/ticketController');
 
 router.route('/')
-  .post(protect, createTicket)
-  .get(protect, getTickets);
+  .get(protect, getTickets)           // all roles (filter by role in controller)
+  .post(protect, createTicket);       // all roles
 
 router.route('/:id')
-  .get(protect, getTicketById)
-  .put(protect, updateTicket)
-  .delete(protect, deleteTicket);
+  .get(protect, getTicketById)        // all roles (filter by role in controller)
+  .put(protect, updateTicket)         // all roles (filter by role in controller)
+  .delete(protect, authorize('admin', 'manager'), deleteTicket); // admin, manager
 
 module.exports = router;
 ```
@@ -482,12 +534,14 @@ PORT=5000
 
 - [ ] Cấu trúc đúng: `models/`, `controllers/`, `routes/`, `middleware/`
 - [ ] Áp dụng đúng cấu trúc response wrapper (status, message, data) cho toàn bộ API
-- [ ] User model với bcryptjs hash password
+- [ ] User model với bcryptjs hash password và field `role` (enum: admin/manager/employee)
 - [ ] JWT trả về sau register & login
 - [ ] `protect` middleware kiểm tra Bearer token → 401 nếu thiếu/sai
-- [ ] Department: đủ 5 CRUD endpoints (Public, không cần protect)
+- [ ] `authorize` middleware kiểm tra role → 403 nếu không đủ quyền
+- [ ] Department: đủ 5 CRUD endpoints, có protect + authorize theo role
 - [ ] `createTicket` tự gán `employee: req.user.id`
-- [ ] `getTickets` có `limit`, `skip`, `sort` (Pagination + Sorting)
-- [ ] `getTicketById` dùng `.populate()` để embed department
-- [ ] `updateTicket` & `deleteTicket` kiểm tra ownership → 403 nếu không phải creator
+- [ ] `getTickets` có `limit`, `skip`, `sort` (Pagination + Sorting); filter theo role
+- [ ] `getTicketById` dùng `.populate()` để embed department; employee chỉ xem ticket của mình
+- [ ] `updateTicket` kiểm tra role: employee chỉ sửa ticket của mình
+- [ ] `deleteTicket` chỉ cho admin/manager (dùng `authorize` ở route)
 - [ ] `try...catch` đầy đủ và đúng HTTP status codes
