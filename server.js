@@ -1,9 +1,11 @@
 const express    = require('express');
 const mongoose   = require('mongoose');
+const morgan     = require('morgan');
 require('dotenv').config();
 
 const app = express();
 app.use(express.json());
+app.use(morgan('dev'));
 
 // Routes
 app.use('/api/auth',        require('./routes/authRoutes'));
